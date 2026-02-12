@@ -30,7 +30,7 @@ DOTENV_PATH = os.environ.get(
         ".env"
     )
 )
-MINIMUM_SUPPORTED_AZURE_OPENAI_PREVIEW_API_VERSION = "2024-05-01-preview"
+MINIMUM_SUPPORTED_AZURE_OPENAI_PREVIEW_API_VERSION = "2025-03-01-preview"
 
 
 class _UiSettings(BaseSettings):
@@ -215,7 +215,8 @@ class _SearchCommonSettings(BaseSettings):
     vectorization_dimensions: Optional[int] = None
     role_information: str = Field(
         default="You are an AI assistant that helps people find information.",
-        validation_alias="AZURE_OPENAI_SYSTEM_MESSAGE"
+        validation_alias="AZURE_OPENAI_SYSTEM_MESSAGE",
+        exclude=True
     )
 
     @field_validator('include_contexts', mode='before')

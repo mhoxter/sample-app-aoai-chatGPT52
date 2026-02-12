@@ -114,6 +114,93 @@ MS_DEFENDER_ENABLED = os.environ.get("MS_DEFENDER_ENABLED", "true").lower() == "
 azure_openai_tools = []
 azure_openai_available_tools = []
 
+# Track whether the On Your Data proxy is incompatible with the model.
+# When True, we bypass data_sources and do manual RAG instead.
+_BYPASS_OYD = False
+
+
+def apply_max_tokens_param(model_args, max_tokens_value, param_name):
+    model_args.pop("max_tokens", None)
+    model_args.pop("max_completion_tokens", None)
+    model_args[param_name] = max_tokens_value
+    return model_args
+
+
+async def _manual_search(user_query: str):
+    """Perform Azure Search manually and return citations + context for injection into messages."""
+    from azure.search.documents.aio import SearchClient
+    from azure.core.credentials import AzureKeyCredential
+
+    ds = app_settings.datasource
+    if ds is None:
+        return None, []
+
+    ds_type = getattr(ds, '_type', None)
+    if ds_type != "azure_search":
+        # Manual RAG fallback only implemented for Azure Search
+        return None, []
+
+    search_endpoint = f"https://{ds.service}.{ds.endpoint_suffix}"
+    index_name = ds.index
+    credential = AzureKeyCredential(ds.key) if ds.key else None
+
+    if credential is None:
+        from azure.identity.aio import DefaultAzureCredential as AsyncDefaultAzureCredential
+        credential = AsyncDefaultAzureCredential()
+
+    query_type_raw = ds.query_type
+    use_semantic = ds.use_semantic_search or "semantic" in (query_type_raw or "")
+    search_kwargs = {}
+    if use_semantic and ds.semantic_search_config:
+        search_kwargs["query_type"] = "semantic"
+        search_kwargs["semantic_configuration_name"] = ds.semantic_search_config
+
+    async with SearchClient(
+        endpoint=search_endpoint,
+        index_name=index_name,
+        credential=credential
+    ) as client:
+        results = await client.search(
+            search_text=user_query,
+            top=ds.top_k,
+            **search_kwargs
+        )
+        docs = []
+        citations = []
+        idx = 0
+        async for result in results:
+            idx += 1
+            doc_id = result.get("id", str(idx))
+            content = ""
+            if ds.content_columns:
+                parts = [str(result.get(col, "")) for col in ds.content_columns if result.get(col)]
+                content = "\n".join(parts)
+            else:
+                # Try common field names
+                for field in ("content", "chunk", "text", "description"):
+                    if result.get(field):
+                        content = str(result[field])
+                        break
+            if not content:
+                content = json.dumps({k: v for k, v in result.items() if k not in ("@search.score", "@search.reranker_score")})
+
+            title = str(result.get(ds.title_column, "")) if ds.title_column else None
+            filepath = str(result.get(ds.filename_column, "")) if ds.filename_column else None
+            url = str(result.get(ds.url_column, "")) if ds.url_column else None
+
+            citations.append({
+                "content": content,
+                "id": doc_id,
+                "title": title,
+                "filepath": filepath,
+                "url": url,
+                "chunk_id": result.get("chunk_id"),
+            })
+            docs.append(f"[doc{idx}]: {content}")
+
+    context_text = "\n\n".join(docs)
+    return context_text, citations
+
 # Initialize Azure OpenAI Client
 async def init_openai_client():
     azure_openai_client = None
@@ -241,7 +328,9 @@ async def init_cosmosdb_client():
 def prepare_model_args(request_body, request_headers):
     request_messages = request_body.get("messages", [])
     messages = []
-    if not app_settings.datasource:
+    bypass_oyd = _BYPASS_OYD
+    
+    if not app_settings.datasource or bypass_oyd:
         messages = [
             {
                 "role": "system",
@@ -284,19 +373,24 @@ def prepare_model_args(request_body, request_headers):
     model_args = {
         "messages": messages,
         "temperature": app_settings.azure_openai.temperature,
-        "max_tokens": app_settings.azure_openai.max_tokens,
         "top_p": app_settings.azure_openai.top_p,
         "stop": app_settings.azure_openai.stop_sequence,
         "stream": app_settings.azure_openai.stream,
         "model": app_settings.azure_openai.model
     }
+    
+    if bypass_oyd:
+        # When bypassing On Your Data, use max_completion_tokens directly
+        apply_max_tokens_param(model_args, app_settings.azure_openai.max_tokens, "max_completion_tokens")
+    else:
+        apply_max_tokens_param(model_args, app_settings.azure_openai.max_tokens, "max_tokens")
 
     if len(messages) > 0:
         if messages[-1]["role"] == "user":
             if app_settings.azure_openai.function_call_azure_functions_enabled and len(azure_openai_tools) > 0:
                 model_args["tools"] = azure_openai_tools
 
-            if app_settings.datasource:
+            if app_settings.datasource and not bypass_oyd:
                 model_args["extra_body"] = {
                     "data_sources": [
                         app_settings.datasource.construct_payload_configuration(
@@ -419,6 +513,8 @@ async def process_function_call(response):
     return None
 
 async def send_chat_request(request_body, request_headers):
+    global _BYPASS_OYD
+    
     filtered_messages = []
     messages = request_body.get("messages", [])
     for message in messages:
@@ -434,8 +530,75 @@ async def send_chat_request(request_body, request_headers):
         response = raw_response.parse()
         apim_request_id = raw_response.headers.get("apim-request-id") 
     except Exception as e:
-        logging.exception("Exception in send_chat_request")
-        raise e
+        error_text = str(e).lower()
+        has_data_sources = model_args.get("extra_body", {}).get("data_sources")
+        
+        # Case: On Your Data proxy rejects max_completion_tokens OR model rejects max_tokens
+        # when data_sources is present. This means the OYD proxy is incompatible with this model.
+        # Switch to manual RAG: search manually, inject results, call model directly.
+        if has_data_sources and (
+            ("max_tokens" in error_text and "unsupported parameter" in error_text) or
+            ("max_completion_tokens" in error_text and "extra input" in error_text)
+        ):
+            logging.warning("On Your Data proxy incompatible with model — switching to manual RAG")
+            _BYPASS_OYD = True
+            
+            # Get user query from the last user message
+            user_query = ""
+            for msg in reversed(model_args["messages"]):
+                if msg.get("role") == "user":
+                    user_query = msg.get("content", "")
+                    break
+            
+            # Perform manual search
+            context_text, citations = await _manual_search(user_query)
+            
+            # Rebuild model_args without data_sources, with manual context
+            model_args = prepare_model_args(request_body, request_headers)
+            
+            if context_text:
+                # Inject search results into system message
+                system_msg = app_settings.azure_openai.system_message
+                augmented_system = (
+                    f"{system_msg}\n\n"
+                    f"## Retrieved Documents\n{context_text}\n\n"
+                    f"Use the above documents to answer the user's question. "
+                    f"Cite sources using [docN] format."
+                )
+                # Replace or prepend system message
+                if model_args["messages"] and model_args["messages"][0].get("role") == "system":
+                    model_args["messages"][0]["content"] = augmented_system
+                else:
+                    model_args["messages"].insert(0, {"role": "system", "content": augmented_system})
+            
+            raw_response = await azure_openai_client.chat.completions.with_raw_response.create(**model_args)
+            response = raw_response.parse()
+            apim_request_id = raw_response.headers.get("apim-request-id")
+            
+            # Attach context with citations so format_non_streaming_response / format_stream_response
+            # can find them (mimic the On Your Data context structure)
+            if citations and hasattr(response, 'choices') and len(response.choices) > 0:
+                citation_context = {"citations": citations}
+                if hasattr(response.choices[0], 'message') and response.choices[0].message:
+                    response.choices[0].message.context = citation_context
+            
+            return response, apim_request_id
+        
+        # Case: no data_sources, simple parameter swap
+        retry_param = None
+        if "max_tokens" in error_text and "unsupported parameter" in error_text:
+            retry_param = "max_completion_tokens"
+        elif "max_completion_tokens" in error_text and "extra input" in error_text:
+            retry_param = "max_tokens"
+
+        if retry_param:
+            model_args = apply_max_tokens_param(model_args, app_settings.azure_openai.max_tokens, retry_param)
+            raw_response = await azure_openai_client.chat.completions.with_raw_response.create(**model_args)
+            response = raw_response.parse()
+            apim_request_id = raw_response.headers.get("apim-request-id")
+        else:
+            logging.exception("Exception in send_chat_request")
+            raise e
 
     return response, apim_request_id
 
@@ -1049,9 +1212,26 @@ async def generate_title(conversation_messages) -> str:
 
     try:
         azure_openai_client = await init_openai_client()
-        response = await azure_openai_client.chat.completions.create(
-            model=app_settings.azure_openai.model, messages=messages, temperature=1, max_tokens=64
-        )
+        try:
+            title_args = {
+                "model": app_settings.azure_openai.model,
+                "messages": messages,
+                "temperature": 1
+            }
+            apply_max_tokens_param(title_args, 64, "max_tokens")
+            response = await azure_openai_client.chat.completions.create(**title_args)
+        except Exception as e:
+            error_text = str(e).lower()
+            if "max_tokens" in error_text and "unsupported parameter" in error_text:
+                title_args = {
+                    "model": app_settings.azure_openai.model,
+                    "messages": messages,
+                    "temperature": 1
+                }
+                apply_max_tokens_param(title_args, 64, "max_completion_tokens")
+                response = await azure_openai_client.chat.completions.create(**title_args)
+            else:
+                raise e
 
         title = response.choices[0].message.content
         return title
