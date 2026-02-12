@@ -188,6 +188,34 @@ async def _manual_search(user_query: str):
             filepath = str(result.get(ds.filename_column, "")) if ds.filename_column else None
             url = str(result.get(ds.url_column, "")) if ds.url_column else None
 
+            # Auto-detect filepath from common field names when not configured
+            if not filepath:
+                for field in (
+                    "metadata_storage_name",
+                    "filepath",
+                    "filename",
+                    "source",
+                    "sourcefile",
+                    "file_name",
+                    "storage_name",
+                ):
+                    val = result.get(field)
+                    if val:
+                        filepath = str(val)
+                        break
+
+            # Auto-detect title from common field names when not configured
+            if not title:
+                for field in ("title", "metadata_title", "name"):
+                    val = result.get(field)
+                    if val:
+                        title = str(val)
+                        break
+
+            # Fall back to filepath as title if still missing
+            if not title and filepath:
+                title = filepath
+
             citations.append({
                 "content": content,
                 "id": doc_id,
@@ -523,6 +551,8 @@ async def send_chat_request(request_body, request_headers):
             
     request_body['messages'] = filtered_messages
     model_args = prepare_model_args(request_body, request_headers)
+    if _BYPASS_OYD:
+        model_args["stream"] = False
 
     try:
         azure_openai_client = await init_openai_client()
@@ -555,6 +585,7 @@ async def send_chat_request(request_body, request_headers):
             
             # Rebuild model_args without data_sources, with manual context
             model_args = prepare_model_args(request_body, request_headers)
+            model_args["stream"] = False
             
             if context_text:
                 # Inject search results into system message
@@ -695,8 +726,26 @@ async def process_function_call_stream(completionChunk, function_call_stream_sta
 
 
 async def stream_chat_request(request_body, request_headers):
-    response, apim_request_id = await send_chat_request(request_body, request_headers)
     history_metadata = request_body.get("history_metadata", {})
+    if _BYPASS_OYD:
+        non_streaming = await complete_chat_request(request_body, request_headers)
+
+        async def generate_non_streaming():
+            yield non_streaming
+
+        return generate_non_streaming()
+
+    response, apim_request_id = await send_chat_request(request_body, request_headers)
+
+    # If _BYPASS_OYD was just set during send_chat_request (first request only),
+    # the response is a non-streaming ChatCompletion. Format it and yield as a single event.
+    if _BYPASS_OYD:
+        non_streaming = format_non_streaming_response(response, history_metadata, apim_request_id)
+
+        async def generate_non_streaming_fallback():
+            yield non_streaming
+
+        return generate_non_streaming_fallback()
     
     async def generate(apim_request_id, history_metadata):
         if app_settings.azure_openai.function_call_azure_functions_enabled:
