@@ -166,11 +166,11 @@ class _AzureOpenAISettings(BaseSettings):
     @model_validator(mode="after")
     def ensure_endpoint(self) -> Self:
         if self.endpoint:
-            return Self
+            return self
         
         elif self.resource:
             self.endpoint = f"https://{self.resource}.openai.azure.com"
-            return Self
+            return self
         
         raise ValidationError("AZURE_OPENAI_ENDPOINT or AZURE_OPENAI_RESOURCE is required")
         
@@ -320,6 +320,7 @@ class _AzureSearchSettings(BaseSettings, DatasourcePayloadConstructor):
     @model_validator(mode="after")
     def set_query_type(self) -> Self:
         self.query_type = to_snake(self.query_type)
+        return self
 
     def _set_filter_string(self, request: Request) -> str:
         if self.permitted_groups_column:
@@ -800,7 +801,7 @@ class _AppSettings(BaseModel):
         try:
             if self.base_settings.datasource_type == "AzureCognitiveSearch":
                 self.datasource = _AzureSearchSettings(settings=self, _env_file=DOTENV_PATH)
-                logging.debug("Using Azure Cognitive Search")
+                logging.info("Using Azure Cognitive Search")
             
             elif self.base_settings.datasource_type == "AzureCosmosDB":
                 self.datasource = _AzureCosmosDbMongoVcoreSettings(settings=self, _env_file=DOTENV_PATH)
@@ -829,12 +830,14 @@ class _AppSettings(BaseModel):
             else:
                 self.datasource = None
                 logging.warning("No datasource configuration found in the environment -- calls will be made to Azure OpenAI without grounding data.")
+                logging.warning(f"DATASOURCE_TYPE was set to: '{self.base_settings.datasource_type}'")
                 
             return self
 
         except ValidationError as e:
             logging.warning("No datasource configuration found in the environment -- calls will be made to Azure OpenAI without grounding data.")
             logging.warning(e.errors())
+            return self
 
 
 app_settings = _AppSettings()
