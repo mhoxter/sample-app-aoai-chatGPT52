@@ -554,11 +554,40 @@ async def send_chat_request(request_body, request_headers):
     if _BYPASS_OYD:
         model_args["stream"] = False
 
+    # When _BYPASS_OYD is already True (subsequent requests after the first),
+    # perform manual search upfront and inject context into messages.
+    manual_citations = None
+    if _BYPASS_OYD and app_settings.datasource:
+        user_query = ""
+        for msg in reversed(model_args["messages"]):
+            if msg.get("role") == "user":
+                user_query = msg.get("content", "")
+                break
+        if user_query:
+            context_text, manual_citations = await _manual_search(user_query)
+            if context_text:
+                system_msg = app_settings.azure_openai.system_message
+                augmented_system = (
+                    f"{system_msg}\n\n"
+                    f"## Retrieved Documents\n{context_text}\n\n"
+                    f"Use the above documents to answer the user's question. "
+                    f"Cite sources using [docN] format."
+                )
+                if model_args["messages"] and model_args["messages"][0].get("role") == "system":
+                    model_args["messages"][0]["content"] = augmented_system
+                else:
+                    model_args["messages"].insert(0, {"role": "system", "content": augmented_system})
+
     try:
         azure_openai_client = await init_openai_client()
         raw_response = await azure_openai_client.chat.completions.with_raw_response.create(**model_args)
         response = raw_response.parse()
-        apim_request_id = raw_response.headers.get("apim-request-id") 
+        apim_request_id = raw_response.headers.get("apim-request-id")
+
+        # Attach citations from manual search to the response
+        if manual_citations and hasattr(response, 'choices') and len(response.choices) > 0:
+            if hasattr(response.choices[0], 'message') and response.choices[0].message:
+                response.choices[0].message.context = {"citations": manual_citations}
     except Exception as e:
         error_text = str(e).lower()
         has_data_sources = model_args.get("extra_body", {}).get("data_sources")
